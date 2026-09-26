@@ -48,12 +48,20 @@
   $: selectedScore = selectedAttempt && selectedGroup ? selectedAttempt.scores.find((score) => score.groupId === selectedGroup?.id) : undefined
   $: completedAttempts = Math.min(project.attempts.length, project.targetAttempts)
   $: progress = Math.round((completedAttempts / Math.max(project.targetAttempts, 1)) * 100)
-  $: averageAccuracy = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / selectedAttempt.scores.length) : 0
-  $: averageDeviation = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.deviation, 0) / selectedAttempt.scores.length) : 0
-  $: totalIssueCategories = project.errorCategories.map((category) => ({ category, count: project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category).length }))
+  $: currentGroupIds = new Set(project.groups.map((group) => group.id))
+  $: liveScores = (selectedAttempt?.scores ?? []).filter((score) => currentGroupIds.has(score.groupId))
+  $: averageAccuracy = liveScores.length ? Math.round(liveScores.reduce((sum, score) => sum + score.accuracy, 0) / liveScores.length) : null
+  $: averageDeviation = liveScores.length ? Math.round(liveScores.reduce((sum, score) => sum + score.deviation, 0) / liveScores.length) : null
+  $: attemptAverages = new Map(project.attempts.map((attempt) => {
+    const scores = attempt.scores.filter((score) => currentGroupIds.has(score.groupId))
+    return [attempt.id, scores.length ? Math.round(scores.reduce((sum, score) => sum + score.accuracy, 0) / scores.length) : null]
+  }))
+  $: totalIssueCategories = project.errorCategories.map((category) => ({ category, count: project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category && currentGroupIds.has(issue.groupId)).length }))
+  $: totalIssueCount = project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => currentGroupIds.has(issue.groupId)).length
 
   const clone = <T,>(value: T): T => structuredClone(value)
   const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+  const fmtPercent = (value: number | null | undefined) => (value == null ? '未评' : `${value}%`)
 
   function editProject(mutator: (draft: PracticeProject) => void) {
     const before = clone(project)
@@ -128,8 +136,16 @@
 
   function deleteGroup() {
     if (!selectedGroup || project.groups.length <= 1) return
-    const index = project.groups.findIndex((group) => group.id === selectedGroup.id)
-    editProject((draft) => { draft.groups = draft.groups.filter((group) => group.id !== selectedGroup?.id) })
+    const groupId = selectedGroup.id
+    const index = project.groups.findIndex((group) => group.id === groupId)
+    editProject((draft) => {
+      draft.groups = draft.groups.filter((group) => group.id !== groupId)
+      for (const attempt of draft.attempts) {
+        attempt.scores = attempt.scores.filter((score) => score.groupId !== groupId)
+        attempt.wordIssues = attempt.wordIssues.filter((issue) => issue.groupId !== groupId)
+        attempt.feedback = attempt.feedback.filter((item) => item.groupId !== groupId)
+      }
+    })
     selectedGroupId = project.groups[Math.max(0, index - 1)]?.id ?? ''
   }
 
@@ -214,7 +230,7 @@
       simulated,
       rangeStart: 0,
       rangeEnd: duration,
-      scores: project.groups.map((group) => ({ groupId: group.id, accuracy: 70, rhythm: 70, deviation: 0, note: '' })),
+      scores: [],
       wordIssues: [],
       feedback: [],
       selfNote: ''
@@ -268,6 +284,16 @@
     if (!audioElement || !selectedAttempt) return
     playbackTime = audioElement.currentTime
     if (playbackTime >= selectedAttempt.rangeEnd) stopPlayback()
+  }
+
+  function beginScoring() {
+    if (!selectedAttempt || !selectedGroup) return
+    editProject((draft) => {
+      const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
+      if (attempt && !attempt.scores.some((score) => score.groupId === selectedGroupId)) {
+        attempt.scores.push({ groupId: selectedGroupId, accuracy: 70, rhythm: 70, deviation: 0, note: '' })
+      }
+    })
   }
 
   function updateScore(field: 'accuracy' | 'rhythm' | 'deviation', value: number) {
@@ -442,8 +468,8 @@
       <strong>{completedAttempts} / {project.targetAttempts} 轮</strong>
     </div>
     <ProgressBar value={progress} />
-    <div class="progress-metric"><span>当前准确度</span><strong>{averageAccuracy}%</strong></div>
-    <div class="progress-metric"><span>平均偏差</span><strong>{averageDeviation}%</strong></div>
+    <div class="progress-metric"><span>当前准确度</span><strong>{fmtPercent(averageAccuracy)}</strong></div>
+    <div class="progress-metric"><span>平均偏差</span><strong>{fmtPercent(averageDeviation)}</strong></div>
     <div class="progress-metric"><span>目标时长</span><strong>{project.targetDuration.toFixed(1)}s</strong></div>
   </section>
 
@@ -585,7 +611,7 @@
             <button class:active={attempt.id === selectedAttempt?.id} class="attempt-item" on:click={() => { selectedAttemptId = attempt.id; stopPlayback() }}>
               <span class="attempt-number">{attempt.number}</span>
               <span><strong>{attempt.label}</strong><small>{attempt.duration.toFixed(1)}s · {attempt.simulated ? '模拟' : '录音'}</small></span>
-              <span class="attempt-score">{attempt.scores.length ? Math.round(attempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / attempt.scores.length) : 0}%</span>
+              <span class="attempt-score">{fmtPercent(attemptAverages.get(attempt.id))}</span>
             </button>
           {/each}
         </div>
@@ -613,6 +639,15 @@
               <label><span>偏差 {selectedScore.deviation}%</span><input class="range" type="range" min="0" max="100" value={selectedScore.deviation} on:input={(event) => updateScore('deviation', Number(event.currentTarget.value))} /></label>
             </div>
             <label class="label"><span>本意群偏差说明</span><textarea class="textarea" rows="2" value={selectedScore.note} on:input={(event) => updateScoreNote(event.currentTarget.value)}></textarea></label>
+          {:else if selectedGroup}
+            <div class="unrated-panel">
+              <span class="badge variant-soft">未评</span>
+              <p>这一轮还没有给「{selectedGroup.text}」评分，不计入准确度与平均偏差。</p>
+              <button class="btn btn-sm variant-soft-primary" on:click={beginScoring}>开始评分</button>
+            </div>
+          {/if}
+          {#if selectedAttempt.archivedScores?.length}
+            <p class="archived-note">已归档 {selectedAttempt.archivedScores.length} 条旧评分（对应已删除意群，不计入平均）。</p>
           {/if}
           <label class="label"><span>本轮自评</span><textarea class="textarea" rows="2" value={selectedAttempt.selfNote} on:input={(event) => editProject((draft) => { const attempt = draft.attempts.find((item) => item.id === selectedAttemptId); if (attempt) attempt.selfNote = event.currentTarget.value })}></textarea></label>
         </div>
@@ -668,9 +703,9 @@
         </div>
         <div class="progress-grid">
           <div><strong>{project.attempts.length}</strong><span>累计尝试</span></div>
-          <div><strong>{averageAccuracy}%</strong><span>当前准确度</span></div>
-          <div><strong>{averageDeviation}%</strong><span>平均偏差</span></div>
-          <div><strong>{project.errorCategories.reduce((sum, category) => sum + project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category).length, 0)}</strong><span>错词记录</span></div>
+          <div><strong>{fmtPercent(averageAccuracy)}</strong><span>当前准确度</span></div>
+          <div><strong>{fmtPercent(averageDeviation)}</strong><span>平均偏差</span></div>
+          <div><strong>{totalIssueCount}</strong><span>错词记录</span></div>
         </div>
         <div class="category-list">
           {#each totalIssueCategories as category}

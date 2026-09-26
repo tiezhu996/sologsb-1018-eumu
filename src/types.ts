@@ -47,6 +47,7 @@ export interface Attempt {
   rangeStart: number
   rangeEnd: number
   scores: GroupScore[]
+  archivedScores?: GroupScore[]
   wordIssues: WordIssue[]
   feedback: SegmentFeedback[]
   selfNote: string

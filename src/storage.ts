@@ -17,7 +17,24 @@ function openDb(): Promise<IDBDatabase> {
   })
 }
 
+function archiveOrphanScores(project: PracticeProject): PracticeProject {
+  const groupIds = new Set(project.groups.map((group) => group.id))
+  let changed = false
+  const attempts = project.attempts.map((attempt) => {
+    const orphaned = attempt.scores.filter((score) => !groupIds.has(score.groupId))
+    if (!orphaned.length) return attempt
+    changed = true
+    return {
+      ...attempt,
+      scores: attempt.scores.filter((score) => groupIds.has(score.groupId)),
+      archivedScores: [...(attempt.archivedScores ?? []), ...orphaned]
+    }
+  })
+  return changed ? { ...project, attempts } : project
+}
+
 export async function loadPractice(): Promise<PracticeProject | null> {
+  let project: PracticeProject | null = null
   try {
     const db = await openDb()
     const value = await new Promise<PersistedPractice | undefined>((resolve, reject) => {
@@ -27,12 +44,15 @@ export async function loadPractice(): Promise<PracticeProject | null> {
       request.onerror = () => reject(request.error)
     })
     db.close()
-    if (value?.project) return value.project
+    if (value?.project) project = value.project
   } catch {
     const raw = localStorage.getItem(FALLBACK_KEY)
-    if (raw) return JSON.parse(raw) as PracticeProject
+    if (raw) project = JSON.parse(raw) as PracticeProject
   }
-  return null
+  if (!project) return null
+  const migrated = archiveOrphanScores(project)
+  if (migrated !== project) await savePractice(migrated)
+  return migrated
 }
 
 export async function savePractice(project: PracticeProject): Promise<'indexeddb' | 'localstorage'> {

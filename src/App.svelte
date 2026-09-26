@@ -45,12 +45,42 @@
 
   $: selectedGroup = project.groups.find((group) => group.id === selectedGroupId) ?? project.groups[0]
   $: selectedAttempt = project.attempts.find((attempt) => attempt.id === selectedAttemptId) ?? project.attempts.at(-1)
-  $: selectedScore = selectedAttempt && selectedGroup ? selectedAttempt.scores.find((score) => score.groupId === selectedGroup?.id) : undefined
+  $: currentGroupIds = new Set(project.groups.map((group) => group.id))
+  $: selectedScore = selectedAttempt && selectedGroup ? selectedAttempt.scores.find((score) => score.groupId === selectedGroup?.id && !score.archived) : undefined
   $: completedAttempts = Math.min(project.attempts.length, project.targetAttempts)
   $: progress = Math.round((completedAttempts / Math.max(project.targetAttempts, 1)) * 100)
-  $: averageAccuracy = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / selectedAttempt.scores.length) : 0
-  $: averageDeviation = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.deviation, 0) / selectedAttempt.scores.length) : 0
-  $: totalIssueCategories = project.errorCategories.map((category) => ({ category, count: project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category).length }))
+  $: averageAccuracy = selectedAttempt ? averageOf(selectedAttempt, 'accuracy') : null
+  $: averageDeviation = selectedAttempt ? averageOf(selectedAttempt, 'deviation') : null
+  $: totalIssueCategories = project.errorCategories.map((category) => ({ category, count: project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category && currentGroupIds.has(issue.groupId)).length }))
+
+  /** 只统计当前仍存在的意群里、且未归档的评分；新加意群在旧录音里保持未评 */
+  function ratedScoresOf(attempt: Attempt) {
+    return attempt.scores.filter((score) => !score.archived && currentGroupIds.has(score.groupId))
+  }
+
+  function averageOf(attempt: Attempt, field: 'accuracy' | 'deviation'): number | null {
+    const scores = ratedScoresOf(attempt)
+    return scores.length ? Math.round(scores.reduce((sum, score) => sum + score[field], 0) / scores.length) : null
+  }
+
+  function archivedScoresOf(attempt: Attempt) {
+    return attempt.scores.filter((score) => score.archived || !currentGroupIds.has(score.groupId))
+  }
+
+  /** 打开旧练习时，挂在已删除意群下的评分按归档处理，不再计入平均数 */
+  function archiveOrphanScores(target: PracticeProject): number {
+    const ids = new Set(target.groups.map((group) => group.id))
+    let archived = 0
+    for (const attempt of target.attempts) {
+      for (const score of attempt.scores) {
+        if (!ids.has(score.groupId) && !score.archived) {
+          score.archived = true
+          archived += 1
+        }
+      }
+    }
+    return archived
+  }
 
   const clone = <T,>(value: T): T => structuredClone(value)
   const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
@@ -129,7 +159,16 @@
   function deleteGroup() {
     if (!selectedGroup || project.groups.length <= 1) return
     const index = project.groups.findIndex((group) => group.id === selectedGroup.id)
-    editProject((draft) => { draft.groups = draft.groups.filter((group) => group.id !== selectedGroup?.id) })
+    const removedId = selectedGroup.id
+    editProject((draft) => {
+      draft.groups = draft.groups.filter((group) => group.id !== removedId)
+      // 同一轮里挂在这个意群下的评分、错词和反馈一起清掉，撤销时随快照一起找回
+      for (const attempt of draft.attempts) {
+        attempt.scores = attempt.scores.filter((score) => score.groupId !== removedId)
+        attempt.wordIssues = attempt.wordIssues.filter((issue) => issue.groupId !== removedId)
+        attempt.feedback = attempt.feedback.filter((item) => item.groupId !== removedId)
+      }
+    })
     selectedGroupId = project.groups[Math.max(0, index - 1)]?.id ?? ''
   }
 
@@ -214,7 +253,7 @@
       simulated,
       rangeStart: 0,
       rangeEnd: duration,
-      scores: project.groups.map((group) => ({ groupId: group.id, accuracy: 70, rhythm: 70, deviation: 0, note: '' })),
+      scores: [],
       wordIssues: [],
       feedback: [],
       selfNote: ''
@@ -274,7 +313,7 @@
     if (!selectedAttempt || !selectedGroup) return
     editProject((draft) => {
       const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
-      let score = attempt?.scores.find((item) => item.groupId === selectedGroupId)
+      let score = attempt?.scores.find((item) => item.groupId === selectedGroupId && !item.archived)
       if (!attempt || !score) {
         attempt?.scores.push({ groupId: selectedGroupId, accuracy: 70, rhythm: 70, deviation: 0, note: '' })
         score = attempt?.scores.at(-1)
@@ -286,7 +325,12 @@
   function updateScoreNote(value: string) {
     if (!selectedAttempt || !selectedGroup) return
     editProject((draft) => {
-      const score = draft.attempts.find((attempt) => attempt.id === selectedAttemptId)?.scores.find((item) => item.groupId === selectedGroupId)
+      const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
+      let score = attempt?.scores.find((item) => item.groupId === selectedGroupId && !item.archived)
+      if (!attempt || !score) {
+        attempt?.scores.push({ groupId: selectedGroupId, accuracy: 70, rhythm: 70, deviation: 0, note: '' })
+        score = attempt?.scores.at(-1)
+      }
       if (score) score.note = value
     })
   }
@@ -391,10 +435,15 @@
     online = navigator.onLine
     const saved = await loadPractice()
     if (saved) project = saved
+    const archivedCount = archiveOrphanScores(project)
+    if (archivedCount) {
+      project = project
+      void savePractice(project)
+    }
     selectedGroupId = project.groups[0]?.id ?? ''
     selectedAttemptId = project.attempts.at(-1)?.id ?? ''
     loaded = true
-    saveStatus = saved ? '已恢复本机练习' : '示例练习已就绪'
+    saveStatus = saved ? (archivedCount ? `已恢复本机练习，归档 ${archivedCount} 条旧评分` : '已恢复本机练习') : '示例练习已就绪'
     window.addEventListener('online', () => { online = true })
     window.addEventListener('offline', () => { online = false })
     window.addEventListener('keydown', onKeydown)
@@ -442,8 +491,8 @@
       <strong>{completedAttempts} / {project.targetAttempts} 轮</strong>
     </div>
     <ProgressBar value={progress} />
-    <div class="progress-metric"><span>当前准确度</span><strong>{averageAccuracy}%</strong></div>
-    <div class="progress-metric"><span>平均偏差</span><strong>{averageDeviation}%</strong></div>
+    <div class="progress-metric"><span>当前准确度</span><strong>{averageAccuracy === null ? '未评' : `${averageAccuracy}%`}</strong></div>
+    <div class="progress-metric"><span>平均偏差</span><strong>{averageDeviation === null ? '未评' : `${averageDeviation}%`}</strong></div>
     <div class="progress-metric"><span>目标时长</span><strong>{project.targetDuration.toFixed(1)}s</strong></div>
   </section>
 
@@ -585,7 +634,7 @@
             <button class:active={attempt.id === selectedAttempt?.id} class="attempt-item" on:click={() => { selectedAttemptId = attempt.id; stopPlayback() }}>
               <span class="attempt-number">{attempt.number}</span>
               <span><strong>{attempt.label}</strong><small>{attempt.duration.toFixed(1)}s · {attempt.simulated ? '模拟' : '录音'}</small></span>
-              <span class="attempt-score">{attempt.scores.length ? Math.round(attempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / attempt.scores.length) : 0}%</span>
+              <span class="attempt-score">{#if averageOf(attempt, 'accuracy') === null}未评{:else}{averageOf(attempt, 'accuracy')}%{/if}</span>
             </button>
           {/each}
         </div>
@@ -606,14 +655,17 @@
             <label><span>回听起点 {selectedAttempt.rangeStart.toFixed(1)}s</span><input class="range" type="range" min="0" max={selectedAttempt.duration} step="0.1" value={selectedAttempt.rangeStart} on:input={(event) => updateRange('rangeStart', Number(event.currentTarget.value))} /></label>
             <label><span>回听终点 {selectedAttempt.rangeEnd.toFixed(1)}s</span><input class="range" type="range" min="0" max={selectedAttempt.duration} step="0.1" value={selectedAttempt.rangeEnd} on:input={(event) => updateRange('rangeEnd', Number(event.currentTarget.value))} /></label>
           </div>
-          {#if selectedScore}
-            <div class="score-grid">
-              <label><span>准确度 {selectedScore.accuracy}%</span><input class="range" type="range" min="0" max="100" value={selectedScore.accuracy} on:input={(event) => updateScore('accuracy', Number(event.currentTarget.value))} /></label>
-              <label><span>节奏 {selectedScore.rhythm}%</span><input class="range" type="range" min="0" max="100" value={selectedScore.rhythm} on:input={(event) => updateScore('rhythm', Number(event.currentTarget.value))} /></label>
-              <label><span>偏差 {selectedScore.deviation}%</span><input class="range" type="range" min="0" max="100" value={selectedScore.deviation} on:input={(event) => updateScore('deviation', Number(event.currentTarget.value))} /></label>
-            </div>
-            <label class="label"><span>本意群偏差说明</span><textarea class="textarea" rows="2" value={selectedScore.note} on:input={(event) => updateScoreNote(event.currentTarget.value)}></textarea></label>
-          {/if}
+          <div class="score-state-row">
+            <span class:unrated={!selectedScore} class="badge score-state">{selectedScore ? '已评' : '未评'}</span>
+            {#if !selectedScore}<span class="score-hint">本轮该意群还没有评分，拖动滑杆即记入，未评不计入平均。</span>{/if}
+            {#if archivedScoresOf(selectedAttempt).length}<span class="score-hint">已归档 {archivedScoresOf(selectedAttempt).length} 条旧评分（意群已删除，不计入平均）</span>{/if}
+          </div>
+          <div class="score-grid">
+            <label><span>准确度 {selectedScore?.accuracy ?? 70}%</span><input class="range" type="range" min="0" max="100" value={selectedScore?.accuracy ?? 70} on:input={(event) => updateScore('accuracy', Number(event.currentTarget.value))} /></label>
+            <label><span>节奏 {selectedScore?.rhythm ?? 70}%</span><input class="range" type="range" min="0" max="100" value={selectedScore?.rhythm ?? 70} on:input={(event) => updateScore('rhythm', Number(event.currentTarget.value))} /></label>
+            <label><span>偏差 {selectedScore?.deviation ?? 0}%</span><input class="range" type="range" min="0" max="100" value={selectedScore?.deviation ?? 0} on:input={(event) => updateScore('deviation', Number(event.currentTarget.value))} /></label>
+          </div>
+          <label class="label"><span>本意群偏差说明</span><textarea class="textarea" rows="2" value={selectedScore?.note ?? ''} on:input={(event) => updateScoreNote(event.currentTarget.value)}></textarea></label>
           <label class="label"><span>本轮自评</span><textarea class="textarea" rows="2" value={selectedAttempt.selfNote} on:input={(event) => editProject((draft) => { const attempt = draft.attempts.find((item) => item.id === selectedAttemptId); if (attempt) attempt.selfNote = event.currentTarget.value })}></textarea></label>
         </div>
 
@@ -668,9 +720,9 @@
         </div>
         <div class="progress-grid">
           <div><strong>{project.attempts.length}</strong><span>累计尝试</span></div>
-          <div><strong>{averageAccuracy}%</strong><span>当前准确度</span></div>
-          <div><strong>{averageDeviation}%</strong><span>平均偏差</span></div>
-          <div><strong>{project.errorCategories.reduce((sum, category) => sum + project.attempts.flatMap((attempt) => attempt.wordIssues).filter((issue) => issue.category === category).length, 0)}</strong><span>错词记录</span></div>
+          <div><strong>{averageAccuracy === null ? '未评' : `${averageAccuracy}%`}</strong><span>当前准确度</span></div>
+          <div><strong>{averageDeviation === null ? '未评' : `${averageDeviation}%`}</strong><span>平均偏差</span></div>
+          <div><strong>{totalIssueCategories.reduce((sum, item) => sum + item.count, 0)}</strong><span>错词记录</span></div>
         </div>
         <div class="category-list">
           {#each totalIssueCategories as category}

@@ -17,6 +17,8 @@ export interface GroupScore {
   rhythm: number
   deviation: number
   note: string
+  /** 载入旧练习时，意群已不存在的评分会被归档，不参与平均数 */
+  archived?: boolean
 }
 
 export interface WordIssue {
